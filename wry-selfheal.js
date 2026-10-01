@@ -13,15 +13,25 @@ const DATA = path.join(DIR, 'data');
 const STATE_FILE = path.join(DATA, 'rdp_guard.json');
 const LOG_FILE = path.join(DATA, 'rdp_guard_selfheal.log');
 const FORCE_FLAG = path.join(DATA, 'selfheal_force.flag');
+const GRACE_FLAG = path.join(DATA, 'selfheal_grace.flag');
 const ENGINE_SCRIPT = path.join(DIR, 'rdp-guard.js');
 const WEB_SCRIPT = path.join(DIR, 'wry-web.js');
 const WEB_PORT = 19888;
 const HB_TIMEOUT_MS = 65 * 1000;    // 心跳超过 65s 视为失联（引擎每 10s 写一次心跳，65s 足够安全且失联恢复更快）
 const START_WAIT_MS = 8000;         // 启动后等待引擎首次写心跳
 
+const LOG_MAX_BYTES = 5 * 1024 * 1024;   // 日志超过 5MB 保留尾部重写，防止无限膨胀
+
 function log(msg) {
     const line = '[' + new Date().toLocaleString('zh-CN', { hour12: false }) + '] ' + msg;
-    console.log(line);
+    // 计划任务环境下 stdout 是管道，无人读取时写满缓冲区会挂死进程；仅在交互终端回显
+    if (process.stdout.isTTY) console.log(line);
+    try {
+        if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+            const keep = fs.readFileSync(LOG_FILE, 'utf8').split(/\r?\n/).slice(-500).join('\r\n');
+            fs.writeFileSync(LOG_FILE, keep + '\r\n');
+        }
+    } catch (e) { /* ignore */ }
     try { fs.appendFileSync(LOG_FILE, line + '\r\n'); } catch (e) {}
 }
 
@@ -51,9 +61,32 @@ function killPids(pids) {
 }
 
 function startProc(script, tag) {
-    const child = spawn(NODE, [script], { cwd: DIR, windowsHide: true, stdio: 'ignore', detached: true });
-    log(tag + ' 已启动 PID=' + child.pid + ' (' + script + ')');
-    child.on('error', (e) => log('ERROR ' + tag + ' 启动失败: ' + e.message));
+    return new Promise((resolve) => {
+        let child;
+        try {
+            child = spawn(NODE, [script], { cwd: DIR, windowsHide: true, stdio: 'ignore', detached: true });
+        } catch (e) {
+            log('ERROR ' + tag + ' spawn 抛出异常: ' + e.message);
+            return resolve(null);
+        }
+        child.on('error', (e) => log('ERROR ' + tag + ' 启动失败: ' + e.message));
+        log(tag + ' 已启动 PID=' + child.pid + ' (' + script + ')');
+        resolve(child.pid);
+    });
+}
+
+// 启动后确认引擎已开始写心跳，避免"启动→下一轮误判失联→再杀"的抖动
+function waitHeartbeat(ms) {
+    const deadline = Date.now() + ms;
+    return new Promise((resolve) => {
+        const tick = () => {
+            const hb = readHeartbeat();
+            if (hb !== null && (Date.now() - hb) <= HB_TIMEOUT_MS) return resolve(true);
+            if (Date.now() >= deadline) return resolve(false);
+            setTimeout(tick, 1000);
+        };
+        tick();
+    });
 }
 
 function checkPort(port, timeout) {
@@ -88,8 +121,8 @@ async function main() {
         const webPids = await findProcs('wry-web.js');
         if (webPids.length) killPids(webPids);
         await new Promise(r => setTimeout(r, 1500));
-        startProc(ENGINE_SCRIPT, '引擎');
-        startProc(WEB_SCRIPT, 'Web');
+        await startProc(ENGINE_SCRIPT, '引擎');
+        await startProc(WEB_SCRIPT, 'Web');
         log('DONE');
         process.exit(0);
     }
@@ -97,15 +130,26 @@ async function main() {
     const hb = readHeartbeat();
     const hbOk = hb !== null && (Date.now() - hb) <= HB_TIMEOUT_MS;
     if (hbOk) {
+        if (fs.existsSync(GRACE_FLAG)) { try { fs.unlinkSync(GRACE_FLAG); } catch (e) {} }
         log('ENGINE_OK 心跳正常');
     } else {
         const age = hb ? Math.round((Date.now() - hb) / 1000) + 's' : '无记录';
-        log('WARN 引擎心跳异常: ' + age);
-        const pids = await findProcs('rdp-guard.js');
-        if (pids.length) { log('杀掉失联引擎进程: ' + pids.join(',')); killPids(pids); }
-        else { log('引擎进程不存在，直接启动'); }
-        await new Promise(r => setTimeout(r, 2000));
-        startProc(ENGINE_SCRIPT, '引擎');
+        // 首次异常不立刻杀：引擎冷启动或 wevtutil 大查询期间心跳会迟滞，
+        // 连续两轮都异常才判定失联，避免"启动→误杀→重启"的抖动风暴
+        if (!fs.existsSync(GRACE_FLAG)) {
+            try { fs.writeFileSync(GRACE_FLAG, String(Date.now())); } catch (e) {}
+            log('WARN 引擎心跳异常: ' + age + '（首轮宽限，下一轮仍异常才重启）');
+        } else {
+            try { fs.unlinkSync(GRACE_FLAG); } catch (e) {}
+            log('WARN 引擎心跳持续异常: ' + age + '，执行重启');
+            const pids = await findProcs('rdp-guard.js');
+            if (pids.length) { log('杀掉失联引擎进程: ' + pids.join(',')); killPids(pids); }
+            else { log('引擎进程不存在，直接启动'); }
+            await new Promise(r => setTimeout(r, 2000));
+            await startProc(ENGINE_SCRIPT, '引擎');
+            const recovered = await waitHeartbeat(START_WAIT_MS);
+            log(recovered ? 'ENGINE_RESTART_OK 心跳已恢复' : 'WARN 引擎启动后 ' + (START_WAIT_MS / 1000) + 's 内未见心跳（冷启动查询可能较慢）');
+        }
     }
     // ---- Web 检查：端口 ----
     const webOk = await checkPort(WEB_PORT);
@@ -115,7 +159,7 @@ async function main() {
         const pids = await findProcs('wry-web.js');
         if (pids.length) { log('杀掉残留 Web 进程: ' + pids.join(',')); killPids(pids); }
         await new Promise(r => setTimeout(r, 1000));
-        startProc(WEB_SCRIPT, 'Web');
+        await startProc(WEB_SCRIPT, 'Web');
     }
     // ---- 如果刚启动过，等待并确认 ----
     log('DONE');

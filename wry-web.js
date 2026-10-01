@@ -33,6 +33,32 @@ function isValidIPv4(ip) {
     return ip.split('.').map(Number).every(n => n >= 0 && n <= 255);
 }
 
+// 原子写状态文件：引擎每 10 秒也会改名同一路径，EPERM/EBUSY 必须重试（与引擎侧重试策略一致）
+function writeStateAtomic(obj) {
+    const tmp = STATE_FILE + '.web.tmp';
+    const data = JSON.stringify(obj, null, 2);
+    for (let attempt = 1; ; attempt++) {
+        try {
+            fs.writeFileSync(tmp, data);
+            fs.renameSync(tmp, STATE_FILE);
+            return;
+        } catch (e) {
+            if (attempt >= 3 || !['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) throw e;
+            const spin = Date.now() + 150;
+            while (Date.now() < spin) { /* brief busy wait */ }
+        }
+    }
+}
+
+// 以磁盘最新内容为基底改状态，避免用旧快照整体覆盖，回退引擎并发写入的计数/封禁数据
+function readStateFresh() {
+    try {
+        return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    } catch (e) {
+        return readState();
+    }
+}
+
 const HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -272,14 +298,12 @@ const server = http.createServer((req, res) => {
             const ruleMissing = err && /没有与指定标准|No items match/i.test(text);
             if (err && !ruleMissing) return sendJSON(res, {ok:false, error:'删除防火墙规则失败: '+((err && err.message) || text)}, 500);
             try {
-                const st = readState();
+                const st = readStateFresh();
                 st.unblockRequests = st.unblockRequests || {};
                 st.unblockRequests[ip] = new Date().toISOString();
                 if (st.blockedIPs && st.blockedIPs[ip]) delete st.blockedIPs[ip];
                 if (st.attempts && st.attempts[ip]) delete st.attempts[ip];
-                const tmp = STATE_FILE + '.web.tmp';
-                fs.writeFileSync(tmp, JSON.stringify(st, null, 2));
-                fs.renameSync(tmp, STATE_FILE);
+                writeStateAtomic(st);
             } catch(e) {
                 return sendJSON(res, {ok:false, error:'更新状态文件失败: '+e.message}, 500);
             }
@@ -287,11 +311,9 @@ const server = http.createServer((req, res) => {
         });
     } else if (u.pathname === '/api/rdp/open' && req.method === 'POST') {
         try {
-            const st = readState();
+            const st = readStateFresh();
             st.rdpOpenRequest = new Date().toISOString();
-            const tmp = STATE_FILE + '.web.tmp';
-            fs.writeFileSync(tmp, JSON.stringify(st, null, 2));
-            fs.renameSync(tmp, STATE_FILE);
+            writeStateAtomic(st);
             sendJSON(res, {ok:true, note:'已请求引擎强制解锁 RDP 端口并解封全部（约 20 秒内生效）'});
         } catch(e) {
             sendJSON(res, {ok:false, error:'更新状态文件失败: '+e.message}, 500);

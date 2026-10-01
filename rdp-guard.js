@@ -9,6 +9,7 @@
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 const os = require('os');
 
 const CONFIG = {
@@ -23,8 +24,13 @@ const CONFIG = {
     rdpAllowRule: "RDP-Guard-Allow-RDP-3389",
     rdpBlockRule: "RDP-Guard-Block-Port-3389",
     wevtutilMaxEvents: 1000,
+    rebuildMaxEvents: 4000,          // 跨天重建时放宽条数上限（只在每天 0 点跑一次，可承受更大查询）
+    unblockTtlMs: 10 * 60 * 1000,    // Web 解封请求有效期：过期即作废，防止陈旧请求永久豁免封禁
     attackLogMax: 500,               // 当日攻击日志上限（防状态文件膨胀）
     blockPrivateIPs: ['192.168.3.88'], // 内网但视为攻击源的 IP（192.168.3.88 跑内网穿透，是唯一攻击源），照常统计并封禁
+    // 只有网络来源的登录失败才算攻击：本地控制台输错密码(LogonType=2)、解锁(7)、服务(5)
+    // 会污染"今日攻击量"并让面板误报。空数组 = 不过滤（恢复旧行为）。
+    rdpLogonTypes: ['3', '10'],      // 3=网络登录(NLA/共享/RDP)，10=远程交互登录
     version: 6,
 };
 
@@ -69,28 +75,43 @@ try {
     log(`状态文件加载失败: ${e.message}`);
 }
 
+// Web 面板写入的解封请求只会被消费一次。saveState 每次都要读磁盘以接收 Web 的新请求，
+// 若不记录"哪一条已被消费"，被删掉的键会被反复从磁盘捞回内存，形成永久豁免封禁的死循环。
+const consumedUnblocks = new Map();   // ip -> 已消费请求的时间戳(ms)
+
+// 从磁盘接收 Web 面板写入的请求（解封 / 强制开端口）。
+// 两道闸门：已消费过的那一条不再回填；超出 TTL 的陈旧请求直接作废（并随下次落盘被清除）。
+function pullWebRequests() {
+    let pending = {};
+    let rdpReq = null;
+    try {
+        if (fs.existsSync(CONFIG.stateFile)) {
+            const onDisk = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
+            if (onDisk && onDisk.unblockRequests && typeof onDisk.unblockRequests === 'object') pending = onDisk.unblockRequests;
+            if (onDisk && onDisk.rdpOpenRequest) rdpReq = onDisk.rdpOpenRequest;
+        }
+    } catch (e) { /* ignore */ }
+    const now = Date.now();
+    const keys = Object.keys(pending).filter(ip => {
+        const ts = Date.parse(pending[ip]);
+        if (isNaN(ts)) return false;
+        if (now - ts > CONFIG.unblockTtlMs) return false;
+        return consumedUnblocks.get(ip) !== ts;
+    });
+    if (keys.length) {
+        state.unblockRequests = state.unblockRequests || {};
+        for (const ip of keys) {
+            state.unblockRequests[ip] = pending[ip];
+            if (state.blockedIPs && state.blockedIPs[ip]) delete state.blockedIPs[ip];
+            if (state.attempts && state.attempts[ip]) delete state.attempts[ip];
+        }
+    }
+    if (rdpReq) state.rdpOpenRequest = rdpReq; else delete state.rdpOpenRequest;
+}
+
 function saveState() {
     try {
-        let pending = {};
-        let rdpReq = null;
-        try {
-            if (fs.existsSync(CONFIG.stateFile)) {
-                const onDisk = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
-                if (onDisk && onDisk.unblockRequests && typeof onDisk.unblockRequests === 'object') pending = onDisk.unblockRequests;
-                if (onDisk && onDisk.rdpOpenRequest) rdpReq = onDisk.rdpOpenRequest;
-            }
-        } catch (e) { /* ignore */ }
-        const keys = Object.keys(pending);
-        if (keys.length) {
-            state.unblockRequests = pending;
-            for (const ip of keys) {
-                if (state.blockedIPs && state.blockedIPs[ip]) delete state.blockedIPs[ip];
-                if (state.attempts && state.attempts[ip]) delete state.attempts[ip];
-            }
-        } else {
-            delete state.unblockRequests;
-        }
-        if (rdpReq) state.rdpOpenRequest = rdpReq; else delete state.rdpOpenRequest;
+        pullWebRequests();
 
         const tmp = CONFIG.stateFile + '.tmp';
         for (let attempt = 1; ; attempt++) {
@@ -147,6 +168,15 @@ function shanghaiDateStr(ms) {
     return new Date(ms + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// 判定一条 4625 是否属于"攻击"：只认网络来源的登录类型。
+// 登录类型缺失时保守放行——宁可多统计，也不因为解析不到字段而漏掉真实攻击。
+function isAttackLogon(logonType) {
+    if (!CONFIG.rdpLogonTypes || !CONFIG.rdpLogonTypes.length) return true;
+    const t = (logonType === undefined || logonType === null || logonType === '' || logonType === '?') ? '' : String(logonType);
+    if (t === '') return true;
+    return CONFIG.rdpLogonTypes.indexOf(t) !== -1;
+}
+
 // 跨天/首次启动时重置并从事件日志重建当天数据（todayFailures/todayIPs/attackLog）
 // 从安全事件日志重建当天数据（todayFailures/todayIPs/attackLog）
 // reset=true: 跨天/首次启动，重置统计并重建；reset=false: 同天重启且日志为空时，仅回填逐条日志（不覆盖统计）
@@ -155,7 +185,7 @@ function rebuildTodayFromEvents(today, reset) {
     if (rebuildingToday) { log('今日统计重建已在进行，跳过本次请求'); return; }
     rebuildingToday = true;
     if (reset) { state.todayFailures = 0; state.todayIPs = {}; state.attackLog = []; }
-    const cmd = `wevtutil qe Security /q:"*[System[EventID=4625]]" /c:${CONFIG.wevtutilMaxEvents} /rd:true /f:xml`;
+    const cmd = `wevtutil qe Security /q:"*[System[EventID=4625]]" /c:${CONFIG.rebuildMaxEvents} /rd:true /f:xml`;
     exec(cmd, { maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
         rebuildingToday = false;
         if (err) { log(`今日统计重建失败: ${err.message}`); return; }
@@ -166,12 +196,16 @@ function rebuildTodayFromEvents(today, reset) {
             const t = new Date(e.time);
             if (isNaN(t.getTime())) continue;
             if (shanghaiDateStr(t.getTime()) !== today) continue;
+            if (!isAttackLogon(e.logonType)) continue;
             const ip = (e.ip && e.ip !== '-') ? e.ip : '(未知)';
             ips[ip] = (ips[ip] || 0) + 1;
             failures++;
             state.attackLog.push({ t: e.time, ip, user: e.user || '?', logonType: e.logonType || '?', status: e.status || '' });
         }
-        if (reset) { state.todayFailures = failures; state.todayIPs = ips; }
+        // 重建来自事件日志全量统计，比增量累加更权威；同时它已套用登录类型过滤，
+        // 因此无论是否跨天都用它校正统计，避免过滤生效后"计数与日志对不上"
+        state.todayFailures = failures;
+        state.todayIPs = ips;
         state.attackLog.sort((a, b) => new Date(a.t) - new Date(b.t));
         if (state.attackLog.length > CONFIG.attackLogMax) state.attackLog = state.attackLog.slice(-CONFIG.attackLogMax);
         log(`今日攻击统计: 失败 ${failures} 次, 攻击源 ${Object.keys(ips).length} 个, 日志 ${state.attackLog.length} 条`);
@@ -250,14 +284,23 @@ function openRdpPort(reason, cb) {
 }
 
 function checkRdpListening() {
-    run(`netstat -ano | findstr :${CONFIG.rdpPort}`, (err, stdout) => {
-        const listening = !err && /LISTENING/i.test(stdout);
+    // 用原生 TCP 探测替代 netstat|findstr：既避免 ":3389" 误匹配 ":33890"，
+    // 也免去每 10 秒拉起一个 cmd.exe + netstat 的开销
+    const s = net.connect({ host: '127.0.0.1', port: CONFIG.rdpPort });
+    let done = false;
+    const fin = (listening) => {
+        if (done) return;
+        done = true;
+        try { s.destroy(); } catch (e) { /* ignore */ }
         if (listening !== state.rdp.portListening) {
             state.rdp.portListening = listening;
             log(`RDP 端口监听状态: ${listening ? '3389 正在监听' : '3389 未监听'}`);
             saveState();
         }
-    });
+    };
+    s.on('connect', () => fin(true));
+    s.on('error', () => fin(false));
+    s.setTimeout(3000, () => fin(false));
 }
 
 // ---------- 封禁 ----------
@@ -350,18 +393,34 @@ function processUnblocks() {
     const reqs = state.unblockRequests || {};
     const ips = Object.keys(reqs);
     if (!ips.length) return;
-    ips.forEach(ip => {
+    for (const ip of ips) {
+        consumedUnblocks.set(ip, Date.parse(reqs[ip]) || Date.now());   // 立墓碑：这一条只消费一次
         if (state.blockedIPs[ip]) {
             delete state.blockedIPs[ip];
             log(`Web 面板手动解封 ${ip}（引擎已同步，防火墙规则由 Web 删除）`);
         }
-        delete state.attempts[ip];
+        if (state.attempts && state.attempts[ip]) delete state.attempts[ip];
         delete reqs[ip];
-    });
+    }
     if (!Object.keys(reqs).length) delete state.unblockRequests;
 }
 
 function reconcileRules() {
+    // 端口封锁规则对账：state 认为端口开放、但防火墙里残留封锁规则时必须清掉，
+    // 否则引擎在"封锁中"状态崩溃后重启，state.rdp.open 恢复为 true，
+    // expireRdpBlock() 会直接 return，那条 block 3389 规则将永久锁死远程桌面。
+    ruleExists(CONFIG.rdpBlockRule, exists => {
+        if (!exists) return;
+        const until = state.rdp.blockUntil ? Date.parse(state.rdp.blockUntil) : NaN;
+        const stillBlocked = !state.rdp.open && !isNaN(until) && until > Date.now();
+        if (stillBlocked) {
+            log('启动对账: RDP 端口封锁规则在位且未到期，保持封锁');
+            return;
+        }
+        log('启动对账: 发现残留的 RDP 端口封锁规则，自动清除恢复开放');
+        openRdpPort('启动对账清理残留封锁规则');
+    });
+
     const ips = Object.keys(state.blockedIPs).filter(ip => {
         const v = state.blockedIPs[ip];
         const until = (v && typeof v === 'object' && v.until) ? Date.parse(v.until) : NaN;
@@ -385,6 +444,9 @@ function pollEvents() {
             }
             const events = parseEvents(stdout);
             const now = Date.now();
+            // 先接收 Web 面板刚写入的请求：它与安全日志无关，本轮就该处理，
+            // 否则要等 saveState 回填、下一轮才消费，解封延迟翻倍
+            pullWebRequests();
             ensureTodayStats();
             consumeRdpOpenRequest();
             expireBans();
@@ -397,6 +459,7 @@ function pollEvents() {
             }
             for (const e of events) {
                 if (e.recordId <= oldLastSeen) continue;
+                if (!isAttackLogon(e.logonType)) continue;   // 本地/服务登录失败：不计入统计，也不触发封禁
                 if (state.todayDate === shanghaiDateStr(now)) {
                     const ipk = (e.ip && e.ip !== '-') ? e.ip : '(未知)';
                     state.todayIPs[ipk] = (state.todayIPs[ipk] || 0) + 1;
